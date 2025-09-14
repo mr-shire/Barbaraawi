@@ -8,6 +8,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -48,6 +53,12 @@ jobs:
             echo "✓ $v present"
           done
 
+      - name: Create cookies.txt if provided
+        if: ${{ secrets.YT_COOKIES_TXT != '' }}
+        run: |
+          echo "${{ secrets.YT_COOKIES_TXT }}" > cookies.txt
+          chmod 600 cookies.txt
+
       - name: Download YouTube Playlist as MP3
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
@@ -55,11 +66,17 @@ jobs:
           mkdir -p downloads
           yt-dlp \
             --yes-playlist \
+            --ignore-errors \
+            --no-abort-on-error \
+            --retries infinite \
+            --fragment-retries infinite \
+            --continue \
             --extract-audio \
             --audio-format mp3 \
             --audio-quality 0 \
             --embed-thumbnail \
             --add-metadata \
+            $([ -f cookies.txt ] && echo "--cookies cookies.txt") \
             -o "downloads/%(title)s.%(ext)s" \
             "$YOUTUBE_PLAYLIST_URL"
 
