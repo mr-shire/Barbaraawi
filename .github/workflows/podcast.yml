@@ -47,21 +47,24 @@ jobs:
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
           IA_COLLECTION: ${{ secrets.IA_COLLECTION }}
           IA_LICENSE_URL: ${{ secrets.IA_LICENSE_URL }}
+        shell: bash
         run: |
+          set -o pipefail
           mkdir -p downloads
+
           if [ -f cookies.txt ]; then
-            COOKIES_FLAG="--cookies cookies.txt"
+            COOKIES_FLAG=(--cookies cookies.txt)
           else
-            COOKIES_FLAG=""
+            COOKIES_FLAG=()
           fi
 
-          # Get list of video IDs
+          # Get video IDs in the playlist
           mapfile -t video_ids < <(yt-dlp --flat-playlist --print "%(id)s" "$YOUTUBE_PLAYLIST_URL")
 
           for vid in "${video_ids[@]}"; do
             echo "=== Processing video $vid ==="
 
-            # Download single video as MP3
+            # Download a single video with a deterministic filename including the ID
             yt-dlp \
               --ignore-errors \
               --ignore-no-formats-error \
@@ -74,31 +77,67 @@ jobs:
               --audio-quality 0 \
               --embed-thumbnail \
               --add-metadata \
-              -o "downloads/%(title)s.%(ext)s" \
-              $COOKIES_FLAG \
-              "https://www.youtube.com/watch?v=$vid"
+              -o "downloads/%(title)s [%(id)s].%(ext)s" \
+              "${COOKIES_FLAG[@]}" \
+              "https://www.youtube.com/watch?v=$vid" || {
+                echo "::error::Download failed for $vid"
+                echo "-----------------------------------"
+                continue
+              }
 
-            # Find newest MP3
-            latest_file=$(ls -t downloads/*.mp3 2>/dev/null | head -n 1)
+            # Find the exact MP3 for this video ID
+            file_glob="downloads/* [${vid}].mp3"
+            shopt -s nullglob
+            matches=( $file_glob )
+            shopt -u nullglob
 
-            # Verify MP3 exists
-            if [ -f "$latest_file" ]; then
-              echo "✅ MP3 created: $latest_file"
-              echo "Uploading to Internet Archive..."
-              IA_ACCESS_KEY="$IA_ACCESS_KEY" IA_SECRET_KEY="$IA_SECRET_KEY" \
-              ia upload "$IA_BUCKET_IDENTIFIER" "$latest_file" \
-                --metadata="collection:$IA_COLLECTION" \
-                --metadata="licenseurl:$IA_LICENSE_URL" \
-                --metadata="mediatype:audio" \
-                --metadata="title:$(basename "$latest_file" .mp3)" \
-                --ignore-existing
-              echo "✅ Upload complete for: $latest_file"
-            else
-              echo "::error::❌ No MP3 found for video $vid — skipping upload."
+            if [ ${#matches[@]} -eq 0 ]; then
+              echo "::error::❌ No MP3 found for $vid after download."
+              echo "-----------------------------------"
+              continue
             fi
 
+            mp3="${matches[0]}"
+            echo "✅ MP3 created: $mp3"
+
+            # Skip upload if the same filename already exists on IA
+            remote_url="https://archive.org/download/${IA_BUCKET_IDENTIFIER}/$(basename "$mp3")"
+            if curl -sfI "$remote_url" >/dev/null; then
+              echo "ℹ️ Already on IA: $(basename "$mp3") — skipping upload."
+              echo "-----------------------------------"
+              continue
+            fi
+
+            echo "Uploading to Internet Archive..."
+            IA_ACCESS_KEY="$IA_ACCESS_KEY" IA_SECRET_KEY="$IA_SECRET_KEY" \
+            ia upload "$IA_BUCKET_IDENTIFIER" "$mp3" \
+              --metadata="collection:$IA_COLLECTION" \
+              --metadata="licenseurl:$IA_LICENSE_URL" \
+              --metadata="mediatype:audio" \
+              --metadata="title:$(basename "$mp3" .mp3)" || {
+                echo "::error::Upload failed for $mp3"
+                echo "-----------------------------------"
+                continue
+              }
+
+            # Confirm it’s visible on IA before proceeding
+            if curl -sfI "$remote_url" >/dev/null; then
+              echo "✅ Upload confirmed on IA: $remote_url"
+            else
+              echo "::warning::Upload may be processing. Not visible yet: $remote_url"
+            fi
             echo "-----------------------------------"
           done
+
+      - name: Fail if no MP3s found locally
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(downloads/*.mp3)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No MP3 files found. Check the per-file logs above."
+            exit 1
+          fi
 
       - name: Build Apple Podcasts–ready RSS feed
         env:
