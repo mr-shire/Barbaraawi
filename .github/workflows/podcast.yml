@@ -84,7 +84,8 @@ jobs:
             --add-metadata \
             $([ -f cookies.txt ] && echo "--cookies cookies.txt") \
             -o "downloads/%(title)s.%(ext)s" \
-            "$YOUTUBE_PLAYLIST_URL"
+            "$YOUTUBE_PLAYLIST_URL" \
+          || echo "⚠️ Some videos failed to download, but continuing..."
 
       - name: Build MP3s + Upload to IA + Generate RSS
         env:
