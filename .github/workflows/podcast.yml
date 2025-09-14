@@ -1,64 +1,179 @@
-name: Build Podcast from YouTube Playlist (Internet Archive)
+import os, re, subprocess, time, hashlib, email.utils, xml.sax.saxutils as sax, sys
+from pathlib import Path
+import boto3
+from mutagen.easyid3 import EasyID3
 
-on:
-  workflow_dispatch:   # lets you trigger manually
-  push:                # runs on any push to main/master branch
-    branches: [ main, master ]
+def need(name: str) -> str:
+    v = os.environ.get(name)
+    if not v:
+        print(f"::error::Missing required env: {name}", file=sys.stderr)
+        sys.exit(1)
+    return v
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+# --- Inputs ---
+PLAYLIST_URL = need("YOUTUBE_PLAYLIST_URL")
+TITLE = need("PODCAST_TITLE")
+AUTHOR = need("PODCAST_AUTHOR")
+DESC = need("PODCAST_DESCRIPTION")
+OWNER_EMAIL = need("PODCAST_OWNER_EMAIL")
+CATEGORY = os.environ.get("PODCAST_CATEGORY", "Education")
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+# Internet Archive
+IA_BUCKET = need("IA_BUCKET_IDENTIFIER")        # item identifier (unique)
+IA_ACCESS = need("IA_ACCESS_KEY")
+IA_SECRET = need("IA_SECRET_KEY")
+IA_COLLECTION = os.environ.get("IA_COLLECTION", "opensource_audio")
+IA_LICENSE_URL = os.environ.get("IA_LICENSE_URL", "")
+IA_ENDPOINT = "https://s3.us.archive.org"
+IA_DOWNLOAD_BASE = f"https://archive.org/download/{IA_BUCKET}/"
 
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+OUT_DIR = Path("out")
+MP3_DIR = OUT_DIR / "mp3"
+MP3_DIR.mkdir(parents=True, exist_ok=True)
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+def run(cmd):
+    print("+", " ".join(cmd))
+    subprocess.check_call(cmd)
 
-      - name: Install dependencies
-        run: pip install -r scripts/requirements.txt
+# 1) Download playlist audio (verbose)
+ydl_template = str(MP3_DIR / "%(upload_date>%Y-%m-%d)s - %(title).200B [%(id)s].%(ext)s")
+run([
+    "yt-dlp", "-v",
+    "-f","bestaudio/best",
+    "--restrict-filenames",
+    "--playlist-reverse",
+    "-o", ydl_template,
+    PLAYLIST_URL
+])
 
-      - name: Build MP3s + Upload to Internet Archive + Generate RSS
-        env:
-          YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
-          PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
-          PODCAST_AUTHOR: ${{ secrets.PODCAST_AUTHOR }}
-          PODCAST_DESCRIPTION: ${{ secrets.PODCAST_DESCRIPTION }}
-          PODCAST_OWNER_EMAIL: ${{ secrets.PODCAST_OWNER_EMAIL }}
-          PODCAST_CATEGORY: ${{ secrets.PODCAST_CATEGORY }}
-          IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
-          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
-          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
-          IA_COLLECTION: ${{ secrets.IA_COLLECTION }}
-          IA_LICENSE_URL: ${{ secrets.IA_LICENSE_URL }}
-        run: python scripts/build_feed.py
+# 2) Convert to podcast-ready MP3 (160k, 44.1kHz, loudness normalized)
+dl_files = sorted(MP3_DIR.glob("*"))
+if not dl_files:
+    print("::error::No files downloaded from playlist. Check the playlist URL/visibility.", file=sys.stderr)
+    sys.exit(1)
 
-      - name: Publish podcast.xml to Pages branch
-        run: |
-          mkdir -p public
-          cp out/podcast.xml public/
-          git config user.name "github-actions"
-          git config user.email "actions@users.noreply.github.com"
-          git fetch origin
-          git checkout -B pages
-          cp -R public/* .
-          git add podcast.xml
-          git commit -m "Publish podcast feed" || echo "No changes to commit"
-          git push -f origin pages
+converted = []
+for f in dl_files:
+    stem = f.name.rsplit(".",1)[0]
+    mp3 = MP3_DIR / (stem + ".mp3")
+    if not mp3.exists():
+        run([
+            "ffmpeg","-y","-i", str(f),
+            "-af","loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-ar","44100","-b:a","160k",
+            str(mp3)
+        ])
+        try:
+            tag = EasyID3(str(mp3))
+        except Exception:
+            from mutagen.id3 import ID3; ID3().save(str(mp3))
+            tag = EasyID3(str(mp3))
+        tag["title"] = stem
+        tag["artist"] = AUTHOR
+        tag["album"] = TITLE
+        tag.save()
+    converted.append(mp3)
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-      contents: read
-    steps:
-      - name: Deploy to GitHub Pages
-        uses: actions/deploy-pages@v4
+# cleanup non-mp3 to save space
+for f in dl_files:
+    if f.suffix.lower() != ".mp3":
+        try: f.unlink()
+        except: pass
+
+# 3) Upload to IA
+try:
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=IA_ACCESS,
+        aws_secret_access_key=IA_SECRET,
+        endpoint_url=IA_ENDPOINT,
+    )
+except Exception as e:
+    print(f"::error::Failed to create IA S3 client: {e}", file=sys.stderr)
+    sys.exit(1)
+
+item_metadata = {
+    "collection": IA_COLLECTION,
+    "mediatype": "audio",
+    "creator": AUTHOR,
+    "title": TITLE,
+}
+if IA_LICENSE_URL:
+    item_metadata["licenseurl"] = IA_LICENSE_URL
+
+items = []
+for mp3 in converted:
+    key = mp3.name
+    try:
+        s3.upload_file(
+            str(mp3),
+            IA_BUCKET,
+            key,
+            ExtraArgs={"ContentType":"audio/mpeg","Metadata":item_metadata}
+        )
+        head = s3.head_object(Bucket=IA_BUCKET, Key=key)
+        size = head["ContentLength"]
+    except Exception as e:
+        print(f"::error::Upload or HEAD failed for {key}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    url = IA_DOWNLOAD_BASE + key
+    m = re.match(r"(\d{4}-\d{2}-\d{2}) - (.+) \[(.+)\]\.mp3$", mp3.name)
+    if m:
+        date_str, t, vid = m.groups()
+        pubDate = email.utils.formatdate(
+            time.mktime(time.strptime(date_str + " 12:00:00","%Y-%m-%d %H:%M:%S")),
+            usegmt=True
+        )
+        guid = vid
+        title = t
+    else:
+        pubDate = email.utils.formatdate(usegmt=True)
+        guid = hashlib.md5(mp3.read_bytes()).hexdigest()
+        title = mp3.stem
+
+    items.append({
+        "title": title, "url": url, "length": str(size),
+        "guid": guid, "pubDate": pubDate
+    })
+
+# 4) Build RSS
+if not items:
+    print("::error::No items to write to RSS (conversion/upload produced zero MP3s).", file=sys.stderr)
+    sys.exit(1)
+
+rss_items = []
+for it in items:
+    rss_items.append(f"""
+    <item>
+      <title>{sax.escape(it['title'])}</title>
+      <description>{sax.escape(it['title'])}</description>
+      <guid isPermaLink="false">{sax.escape(it['guid'])}</guid>
+      <pubDate>{it['pubDate']}</pubDate>
+      <enclosure url="{sax.escape(it['url'])}" length="{it['length']}" type="audio/mpeg" />
+      <itunes:author>{sax.escape(AUTHOR)}</itunes:author>
+      <itunes:explicit>false</itunes:explicit>
+      <itunes:episodeType>full</itunes:episodeType>
+    </item>""")
+
+rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" version="2.0">
+  <channel>
+    <title>{sax.escape(TITLE)}</title>
+    <link>https://archive.org/details/{sax.escape(IA_BUCKET)}</link>
+    <language>en</language>
+    <description>{sax.escape(DESC)}</description>
+    <itunes:author>{sax.escape(AUTHOR)}</itunes:author>
+    <itunes:owner>
+      <itunes:name>{sax.escape(AUTHOR)}</itunes:name>
+      <itunes:email>{sax.escape(OWNER_EMAIL)}</itunes:email>
+    </itunes:owner>
+    <itunes:category text="{sax.escape(CATEGORY)}" />
+    <itunes:explicit>false</itunes:explicit>
+    {''.join(rss_items)}
+  </channel>
+</rss>
+"""
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+(OUT_DIR / "podcast.xml").write_text(rss, encoding="utf-8")
+print(f"Wrote out/podcast.xml with {len(items)} items")
