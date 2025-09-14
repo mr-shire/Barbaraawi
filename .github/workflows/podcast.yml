@@ -1,4 +1,4 @@
-name: Build Podcast from YouTube Playlist
+name: Build Podcast and Upload to Internet Archive
 
 on:
   workflow_dispatch:
@@ -19,40 +19,13 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg
+      - name: Install ffmpeg, IA CLI, and latest yt-dlp nightly
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies (latest yt-dlp nightly)
-        run: |
           python -m pip install --upgrade pip
-          if [ -f scripts/requirements.txt ]; then pip install -r scripts/requirements.txt; fi
+          pip install internetarchive
           pip install --upgrade --force-reinstall "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
-
-      - name: Validate required secrets
-        env:
-          YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
-          PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
-          PODCAST_AUTHOR: ${{ secrets.PODCAST_AUTHOR }}
-          PODCAST_DESCRIPTION: ${{ secrets.PODCAST_DESCRIPTION }}
-          PODCAST_OWNER_EMAIL: ${{ secrets.PODCAST_OWNER_EMAIL }}
-          PODCAST_CATEGORY: ${{ secrets.PODCAST_CATEGORY }}
-        run: |
-          set -e
-          for v in YOUTUBE_PLAYLIST_URL PODCAST_TITLE PODCAST_AUTHOR PODCAST_DESCRIPTION PODCAST_OWNER_EMAIL PODCAST_CATEGORY; do
-            if [ -z "${!v}" ]; then
-              echo "::error::Missing $v"
-              exit 1
-            fi
-            echo "OK: $v"
-          done
 
       - name: Create cookies.txt if provided
         env:
@@ -61,21 +34,20 @@ jobs:
           if [ -n "$YT_COOKIES_TXT" ]; then
             printf '%s' "$YT_COOKIES_TXT" > cookies.txt
             chmod 600 cookies.txt
-            echo "cookies.txt created"
+            echo "✓ cookies.txt created"
           else
-            echo "No cookies provided"
+            echo "No cookies provided — proceeding without"
           fi
 
-      - name: Download playlist audio
+      - name: Download YouTube Playlist as MP3
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
-        shell: bash
         run: |
-          set +e
           mkdir -p downloads
-          COOKIES_FLAG=()
           if [ -f cookies.txt ]; then
-            COOKIES_FLAG=(--cookies cookies.txt)
+            COOKIES_FLAG="--cookies cookies.txt"
+          else
+            COOKIES_FLAG=""
           fi
           yt-dlp \
             --yes-playlist \
@@ -91,18 +63,8 @@ jobs:
             --embed-thumbnail \
             --add-metadata \
             -o "downloads/%(title)s.%(ext)s" \
-            "${COOKIES_FLAG[@]}" \
+            $COOKIES_FLAG \
             "$YOUTUBE_PLAYLIST_URL"
-          EC=$?
-          if [ $EC -ne 0 ]; then
-            echo "Some videos failed to download (exit $EC), continuing."
-          fi
-          exit 0
-
-      - name: List downloaded MP3s
-        run: |
-          echo "MP3 files in downloads/:"
-          ls -lh downloads || echo "No downloads directory found"
 
       - name: Fail if no MP3s found
         shell: bash
@@ -114,6 +76,24 @@ jobs:
             exit 1
           fi
 
+      - name: Upload MP3s to Internet Archive
+        env:
+          IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          IA_COLLECTION: ${{ secrets.IA_COLLECTION }}
+          IA_LICENSE_URL: ${{ secrets.IA_LICENSE_URL }}
+        run: |
+          ia configure --username="$IA_ACCESS_KEY" --password="$IA_SECRET_KEY"
+          for f in downloads/*.mp3; do
+            echo "Uploading $f to IA..."
+            ia upload "$IA_BUCKET_IDENTIFIER" "$f" \
+              --metadata="collection:$IA_COLLECTION" \
+              --metadata="licenseurl:$IA_LICENSE_URL" \
+              --metadata="mediatype:audio" \
+              --metadata="title:$(basename "$f" .mp3)"
+          done
+
       - name: Build RSS feed
         env:
           PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
@@ -121,15 +101,12 @@ jobs:
           PODCAST_DESCRIPTION: ${{ secrets.PODCAST_DESCRIPTION }}
           PODCAST_OWNER_EMAIL: ${{ secrets.PODCAST_OWNER_EMAIL }}
           PODCAST_CATEGORY: ${{ secrets.PODCAST_CATEGORY }}
+          IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
         run: python scripts/build_feed.py
 
       - name: Prepare Pages artifact
         run: |
           mkdir -p public
-          if [ ! -f out/podcast.xml ]; then
-            echo "::error::podcast.xml not found — check build_feed.py output path"
-            exit 1
-          fi
           cp out/podcast.xml public/
 
       - name: Upload artifact for GitHub Pages
