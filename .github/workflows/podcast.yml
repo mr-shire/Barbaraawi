@@ -106,6 +106,7 @@ jobs:
             safe_name=$(basename "$mp3" \
               | iconv -f utf-8 -t ascii//TRANSLIT \
               | tr ' ' '_' \
+              | tr -d '*?\\/:\"<>|'\''`' \
               | tr -cd '[:alnum:]._-')
             safe_path="downloads/$safe_name"
             if [ "$mp3" != "$safe_path" ]; then
