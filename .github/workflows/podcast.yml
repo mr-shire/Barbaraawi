@@ -1,4 +1,4 @@
-name: Build Podcast and Upload to Internet Archive (max-safe filenames)
+name: Build Podcast and Upload to Internet Archive (hardened filenames + retries)
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
       - name: Install ffmpeg, IA CLI, and latest yt-dlp nightly
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg jq curl
           python -m pip install --upgrade pip
           pip install internetarchive
           pip install --upgrade --force-reinstall "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
@@ -39,7 +39,7 @@ jobs:
             echo "No cookies provided — proceeding without"
           fi
 
-      - name: Download, sanitise, and upload each MP3
+      - name: Download, sanitize, and upload each MP3 with retries
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
           IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
@@ -52,13 +52,27 @@ jobs:
           set -o pipefail
           mkdir -p downloads
 
+          # Helper: sanitize an arbitrary string into a safe filename stem
+          sanitize_stem () {
+            # Read from stdin, output sanitized, lowercased, deduped, trimmed, length-limited
+            tr '\n' ' ' \
+            | iconv -f utf-8 -t ascii//TRANSLIT \
+            | tr ' ' '_' \
+            | sed 's/[^A-Za-z0-9._-]//g' \
+            | sed 's/[_-]\{2,\}/_/g' \
+            | sed 's/^[_-]*//;s/[_-]*$//' \
+            | tr '[:upper:]' '[:lower:]' \
+            | awk '{ s=$0; if (length(s)>80) s=substr(s,1,80); print s }'
+          }
+
+          # Use cookies if provided
           if [ -f cookies.txt ]; then
             COOKIES_FLAG=(--cookies cookies.txt)
           else
             COOKIES_FLAG=()
           fi
 
-          # Get video IDs and titles
+          # Get stable list of IDs and titles from the playlist
           mapfile -t videos < <(yt-dlp --flat-playlist --print "%(id)s\t%(title)s" "$YOUTUBE_PLAYLIST_URL")
 
           for entry in "${videos[@]}"; do
@@ -66,9 +80,9 @@ jobs:
             orig_title="${entry#*$'\t'}"
             echo "=== Processing video $vid ==="
 
-            # Download single video
+            # Download as MP3 into a temporary filename first to avoid clashes
+            # We still include [%(id)s] for easy association if needed
             yt-dlp \
-              --ignore-errors \
               --ignore-no-formats-error \
               --no-abort-on-error \
               --retries infinite \
@@ -87,67 +101,90 @@ jobs:
                 continue
               }
 
-            # Find MP3 for this video ID
-            file_glob="downloads/* [${vid}].mp3"
+            # Locate the MP3 just created for this ID
             shopt -s nullglob
-            matches=( $file_glob )
+            matches=( downloads/*\ [${vid}].mp3 )
             shopt -u nullglob
-
             if [ ${#matches[@]} -eq 0 ]; then
               echo "::error::❌ No MP3 found for $vid after download."
               echo "-----------------------------------"
               continue
             fi
+            src_mp3="${matches[0]}"
+            echo "✅ MP3 created: $src_mp3"
 
-            mp3="${matches[0]}"
-            echo "✅ MP3 created: $mp3"
-
-            # Create strict IA-safe ASCII filename
-            safe_name=$(basename "$mp3" \
-              | iconv -f utf-8 -t ascii//TRANSLIT \
-              | tr ' ' '_' \
-              | sed 's/[^A-Za-z0-9._-]//g' \
-              | sed 's/[_-]\{2,\}/_/g' \
-              | sed 's/^[_-]*//;s/[_-]*$//')
-            # Fallback if empty
-            if [ -z "$safe_name" ]; then
-              safe_name="file_${vid}.mp3"
+            # Build a deterministic, safe final name from the original title + ID
+            safe_stem=$(printf '%s' "$orig_title" | sanitize_stem)
+            if [ -z "$safe_stem" ]; then
+              safe_stem="episode"
             fi
-            safe_path="downloads/$safe_name"
-            if [ "$mp3" != "$safe_path" ]; then
-              mv "$mp3" "$safe_path"
-              echo "Renamed for IA: $safe_path"
+            # Ensure uniqueness by appending the video ID and guaranteeing it ends with .mp3
+            final_name="${safe_stem}__${vid}.mp3"
+            # As a last safeguard, enforce whitelist on the full name
+            final_name=$(printf '%s' "$final_name" | sed 's/[^A-Za-z0-9._-]//g' | tr '[:upper:]' '[:lower:]')
+            final_path="downloads/$final_name"
+
+            # Move/rename the file to the final IA-safe path
+            if [ "$src_mp3" != "$final_path" ]; then
+              mv -f "$src_mp3" "$final_path"
+              echo "Renamed to IA-safe: $final_path"
             fi
 
-            # Save mapping for RSS builder
-            echo -e "${safe_name}\t${orig_title}" >> downloads/title_map.txt
+            # Save mapping for RSS builder (safe name -> original title)
+            echo -e "${final_name}\t${orig_title}" >> downloads/title_map.txt
 
-            # Skip upload if already on IA
-            remote_url="https://archive.org/download/${IA_BUCKET_IDENTIFIER}/$(basename "$safe_path")"
+            # If already present on IA, skip upload
+            remote_url="https://archive.org/download/${IA_BUCKET_IDENTIFIER}/${final_name}"
             if curl -sfI "$remote_url" >/dev/null; then
-              echo "ℹ️ Already on IA: $(basename "$safe_path") — skipping upload."
+              echo "ℹ️ Already on IA: ${final_name} — skipping upload."
               echo "-----------------------------------"
               continue
             fi
 
-            echo "Uploading to Internet Archive..."
-            IA_ACCESS_KEY="$IA_ACCESS_KEY" IA_SECRET_KEY="$IA_SECRET_KEY" \
-            ia upload "$IA_BUCKET_IDENTIFIER" "$safe_path" \
-              --metadata="collection:$IA_COLLECTION" \
-              --metadata="licenseurl:$IA_LICENSE_URL" \
-              --metadata="mediatype:audio" \
-              --metadata="title:$orig_title" || {
-                echo "::error::Upload failed for $safe_path"
-                echo "-----------------------------------"
-                continue
-              }
+            # Upload with retries + backoff to handle transient failures (e.g., 503 slowdown)
+            max_attempts=6
+            delay=3
+            attempt=1
+            upload_ok=0
+            while [ $attempt -le $max_attempts ]; do
+              echo "Uploading to IA (attempt $attempt/$max_attempts)..."
+              IA_ACCESS_KEY="$IA_ACCESS_KEY" IA_SECRET_KEY="$IA_SECRET_KEY" \
+              ia upload "$IA_BUCKET_IDENTIFIER" "$final_path" \
+                --metadata="collection:${IA_COLLECTION}" \
+                --metadata="licenseurl:${IA_LICENSE_URL}" \
+                --metadata="mediatype:audio" \
+                --metadata="title:${orig_title}" \
+                --metadata="creator:${{ github.repository_owner }}" \
+                --metadata="subject:podcast, youtube, audio" \
+                --metadata="originalurl:https://www.youtube.com/watch?v=${vid}"
+              rc=$?
 
-            # Confirm upload
-            if curl -sfI "$remote_url" >/dev/null; then
-              echo "✅ Upload confirmed on IA: $remote_url"
-            else
-              echo "::warning::Upload may be processing. Not visible yet: $remote_url"
+              if [ $rc -eq 0 ]; then
+                # Confirm visibility on IA (HEAD)
+                if curl -sfI "$remote_url" >/dev/null; then
+                  echo "✅ Upload confirmed on IA: $remote_url"
+                  upload_ok=1
+                  break
+                else
+                  echo "::warning::Upload succeeded but file not visible yet. Waiting..."
+                  sleep $delay
+                fi
+              else
+                echo "::warning::ia upload returned $rc"
+                sleep $delay
+              fi
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+              [ $delay -gt 60 ] && delay=60
+            done
+
+            if [ $upload_ok -ne 1 ]; then
+              echo "::error::Upload failed after retries for ${final_name}"
+              # Continue to next video instead of failing the whole job
             fi
+
+            # Gentle pacing to avoid IA slowdown
+            sleep 2
             echo "-----------------------------------"
           done
 
