@@ -76,7 +76,7 @@ jobs:
             exit 1
           fi
 
-      - name: Upload MP3s to Internet Archive
+      - name: Upload MP3s to Internet Archive (one by one)
         env:
           IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
@@ -84,14 +84,15 @@ jobs:
           IA_COLLECTION: ${{ secrets.IA_COLLECTION }}
           IA_LICENSE_URL: ${{ secrets.IA_LICENSE_URL }}
         run: |
-          ia configure --username="$IA_ACCESS_KEY" --password="$IA_SECRET_KEY"
           for f in downloads/*.mp3; do
             echo "Uploading $f to IA..."
+            IA_ACCESS_KEY="$IA_ACCESS_KEY" IA_SECRET_KEY="$IA_SECRET_KEY" \
             ia upload "$IA_BUCKET_IDENTIFIER" "$f" \
               --metadata="collection:$IA_COLLECTION" \
               --metadata="licenseurl:$IA_LICENSE_URL" \
               --metadata="mediatype:audio" \
-              --metadata="title:$(basename "$f" .mp3)"
+              --metadata="title:$(basename "$f" .mp3)" \
+              --ignore-existing
           done
 
       - name: Build Apple Podcasts–ready RSS feed
