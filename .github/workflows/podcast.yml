@@ -54,10 +54,16 @@ jobs:
           done
 
       - name: Create cookies.txt if provided
-        if: ${{ secrets.YT_COOKIES_TXT != '' }}
+        env:
+          YT_COOKIES_TXT: ${{ secrets.YT_COOKIES_TXT }}
         run: |
-          echo "${{ secrets.YT_COOKIES_TXT }}" > cookies.txt
-          chmod 600 cookies.txt
+          if [ -n "$YT_COOKIES_TXT" ]; then
+            echo "$YT_COOKIES_TXT" > cookies.txt
+            chmod 600 cookies.txt
+            echo "✓ cookies.txt created"
+          else
+            echo "No cookies provided — proceeding without"
+          fi
 
       - name: Download YouTube Playlist as MP3
         env:
