@@ -1,9 +1,11 @@
-name: Build Podcast from YouTube Playlist (Internet Archive)
+name: Build Podcast
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
 
 jobs:
   build:
@@ -49,8 +51,11 @@ jobs:
         run: |
           set -e
           for v in YOUTUBE_PLAYLIST_URL PODCAST_TITLE PODCAST_AUTHOR PODCAST_DESCRIPTION PODCAST_OWNER_EMAIL PODCAST_CATEGORY IA_BUCKET_IDENTIFIER IA_ACCESS_KEY IA_SECRET_KEY IA_COLLECTION; do
-            [ -n "${!v}" ] || { echo "::error::Missing $v"; exit 1; }
-            echo "✓ $v present"
+            if [ -z "${!v}" ]; then
+              echo "::error::Missing $v"
+              exit 1
+            fi
+            echo "ok: $v"
           done
 
       - name: Create cookies.txt if provided
@@ -58,18 +63,24 @@ jobs:
           YT_COOKIES_TXT: ${{ secrets.YT_COOKIES_TXT }}
         run: |
           if [ -n "$YT_COOKIES_TXT" ]; then
-            echo "$YT_COOKIES_TXT" > cookies.txt
+            printf '%s' "$YT_COOKIES_TXT" > cookies.txt
             chmod 600 cookies.txt
-            echo "✓ cookies.txt created"
+            echo "cookies.txt created"
           else
             echo "No cookies provided — proceeding without"
           fi
 
-      - name: Download YouTube Playlist as MP3
+      - name: Download playlist audio
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
         run: |
+          set +e
           mkdir -p downloads
+          if [ -f cookies.txt ]; then
+            COOKIES_FLAG="--cookies cookies.txt"
+          else
+            COOKIES_FLAG=""
+          fi
           yt-dlp \
             --yes-playlist \
             --ignore-errors \
@@ -82,24 +93,31 @@ jobs:
             --audio-quality 0 \
             --embed-thumbnail \
             --add-metadata \
-            $([ -f cookies.txt ] && echo "--cookies cookies.txt") \
             -o "downloads/%(title)s.%(ext)s" \
-            "$YOUTUBE_PLAYLIST_URL" \
-          || echo "⚠️ Some videos failed to download, but continuing..."
+            $COOKIES_FLAG \
+            "$YOUTUBE_PLAYLIST_URL"
+          EC=$?
+          if [ $EC -ne 0 ]; then
+            echo "Some videos failed to download (exit $EC), continuing."
+          fi
+          exit 0
 
-      - name: Debug: list downloaded MP3s
+      - name: List downloaded MP3s
         run: |
           echo "MP3 files in downloads/:"
           ls -lh downloads || echo "No downloads directory found"
 
       - name: Fail if no MP3s found
+        shell: bash
         run: |
-          if [ -z "$(ls -A downloads/*.mp3 2>/dev/null)" ]; then
-            echo "::error::No MP3 files found. Check YouTube download step."
+          shopt -s nullglob
+          files=(downloads/*.mp3)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No MP3 files found. Check the YouTube download step logs."
             exit 1
           fi
 
-      - name: Build MP3s + Upload to IA + Generate RSS
+      - name: Build RSS feed
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
           PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
@@ -118,7 +136,7 @@ jobs:
         run: |
           mkdir -p public
           if [ ! -f out/podcast.xml ]; then
-            echo "::error::podcast.xml not found — check build_feed.py output"
+            echo "::error::podcast.xml not found — check build_feed.py output path"
             exit 1
           fi
           cp out/podcast.xml public/
