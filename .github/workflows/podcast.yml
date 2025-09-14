@@ -1,7 +1,64 @@
-name: Barbaraawi
+name: Build Podcast from YouTube Playlist (Internet Archive)
 
 on:
-  workflow_dispatch:   # enables the "Run workflow" button
-  push:                # also run on any push to the repo
+  workflow_dispatch:   # lets you trigger manually
+  push:                # runs on any push to main/master branch
     branches: [ main, master ]
 
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Build MP3s + Upload to Internet Archive + Generate RSS
+        env:
+          YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
+          PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
+          PODCAST_AUTHOR: ${{ secrets.PODCAST_AUTHOR }}
+          PODCAST_DESCRIPTION: ${{ secrets.PODCAST_DESCRIPTION }}
+          PODCAST_OWNER_EMAIL: ${{ secrets.PODCAST_OWNER_EMAIL }}
+          PODCAST_CATEGORY: ${{ secrets.PODCAST_CATEGORY }}
+          IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          IA_COLLECTION: ${{ secrets.IA_COLLECTION }}
+          IA_LICENSE_URL: ${{ secrets.IA_LICENSE_URL }}
+        run: python scripts/build_feed.py
+
+      - name: Publish podcast.xml to Pages branch
+        run: |
+          mkdir -p public
+          cp out/podcast.xml public/
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git fetch origin
+          git checkout -B pages
+          cp -R public/* .
+          git add podcast.xml
+          git commit -m "Publish podcast feed" || echo "No changes to commit"
+          git push -f origin pages
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
