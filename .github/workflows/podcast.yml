@@ -1,4 +1,4 @@
-name: Build Podcast from YouTube Playlist (Internet Archive)
+name: Barbaraawi
 
 on:
   workflow_dispatch:   # enables the "Run workflow" button
