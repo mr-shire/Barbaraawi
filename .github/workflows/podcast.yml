@@ -1,1 +1,7 @@
+name: Build Podcast from YouTube Playlist (Internet Archive)
+
+on:
+  workflow_dispatch:   # enables the "Run workflow" button
+  push:                # also run on any push to the repo
+    branches: [ main, master ]
 
