@@ -1,4 +1,4 @@
-name: Build Podcast and Upload to Internet Archive (safe filenames)
+name: Build Podcast and Upload to Internet Archive (strict safe filenames)
 
 on:
   workflow_dispatch:
@@ -58,13 +58,15 @@ jobs:
             COOKIES_FLAG=()
           fi
 
-          # Get video IDs in the playlist
-          mapfile -t video_ids < <(yt-dlp --flat-playlist --print "%(id)s" "$YOUTUBE_PLAYLIST_URL")
+          # Get video IDs and titles
+          mapfile -t videos < <(yt-dlp --flat-playlist --print "%(id)s\t%(title)s" "$YOUTUBE_PLAYLIST_URL")
 
-          for vid in "${video_ids[@]}"; do
+          for entry in "${videos[@]}"; do
+            vid="${entry%%$'\t'*}"
+            orig_title="${entry#*$'\t'}"
             echo "=== Processing video $vid ==="
 
-            # Download a single video with ID in filename
+            # Download single video
             yt-dlp \
               --ignore-errors \
               --ignore-no-formats-error \
@@ -85,7 +87,7 @@ jobs:
                 continue
               }
 
-            # Find the MP3 for this video ID
+            # Find MP3 for this video ID
             file_glob="downloads/* [${vid}].mp3"
             shopt -s nullglob
             matches=( $file_glob )
@@ -100,13 +102,19 @@ jobs:
             mp3="${matches[0]}"
             echo "✅ MP3 created: $mp3"
 
-            # Create safe ASCII filename for IA upload
-            safe_name=$(basename "$mp3" | iconv -f utf-8 -t ascii//TRANSLIT | tr -cd '[:alnum:]._-')
+            # Create strict IA-safe ASCII filename
+            safe_name=$(basename "$mp3" \
+              | iconv -f utf-8 -t ascii//TRANSLIT \
+              | tr ' ' '_' \
+              | tr -cd '[:alnum:]._-')
             safe_path="downloads/$safe_name"
             if [ "$mp3" != "$safe_path" ]; then
               mv "$mp3" "$safe_path"
               echo "Renamed for IA: $safe_path"
             fi
+
+            # Save mapping for RSS builder
+            echo -e "${safe_name}\t${orig_title}" >> downloads/title_map.txt
 
             # Skip upload if already on IA
             remote_url="https://archive.org/download/${IA_BUCKET_IDENTIFIER}/$(basename "$safe_path")"
@@ -122,7 +130,7 @@ jobs:
               --metadata="collection:$IA_COLLECTION" \
               --metadata="licenseurl:$IA_LICENSE_URL" \
               --metadata="mediatype:audio" \
-              --metadata="title:$(basename "$mp3" .mp3)" || {
+              --metadata="title:$orig_title" || {
                 echo "::error::Upload failed for $safe_path"
                 echo "-----------------------------------"
                 continue
