@@ -1,4 +1,4 @@
-name: Build Podcast and Upload to Internet Archive (per file)
+name: Build Podcast and Upload to Internet Archive (verify per file)
 
 on:
   workflow_dispatch:
@@ -34,12 +34,12 @@ jobs:
           if [ -n "$YT_COOKIES_TXT" ]; then
             printf '%s' "$YT_COOKIES_TXT" > cookies.txt
             chmod 600 cookies.txt
-            echo "cookies.txt created"
+            echo "✓ cookies.txt created"
           else
-            echo "No cookies provided"
+            echo "No cookies provided — proceeding without"
           fi
 
-      - name: Download playlist and upload each MP3 to IA
+      - name: Download, verify, and upload each MP3
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
           IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
@@ -55,33 +55,50 @@ jobs:
             COOKIES_FLAG=""
           fi
 
-          yt-dlp \
-            --yes-playlist \
-            --ignore-errors \
-            --ignore-no-formats-error \
-            --no-abort-on-error \
-            --retries infinite \
-            --fragment-retries infinite \
-            --continue \
-            --extract-audio \
-            --audio-format mp3 \
-            --audio-quality 0 \
-            --embed-thumbnail \
-            --add-metadata \
-            -o "downloads/%(title)s.%(ext)s" \
-            --exec 'bash -lc "IA_ACCESS_KEY=\"$IA_ACCESS_KEY\" IA_SECRET_KEY=\"$IA_SECRET_KEY\" ia upload \"$IA_BUCKET_IDENTIFIER\" \"{}\" --metadata=collection:$IA_COLLECTION --metadata=licenseurl:$IA_LICENSE_URL --metadata=mediatype:audio --metadata=title:$(basename \"{}\" .mp3) --ignore-existing || echo IA_UPLOAD_FAILED: {}"' \
-            $COOKIES_FLAG \
-            "$YOUTUBE_PLAYLIST_URL"
+          # Get list of video IDs
+          mapfile -t video_ids < <(yt-dlp --flat-playlist --print "%(id)s" "$YOUTUBE_PLAYLIST_URL")
 
-      - name: Fail if no MP3s found
-        shell: bash
-        run: |
-          shopt -s nullglob
-          files=(downloads/*.mp3)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::No MP3 files found. Check yt-dlp logs."
-            exit 1
-          fi
+          for vid in "${video_ids[@]}"; do
+            echo "=== Processing video $vid ==="
+
+            # Download single video as MP3
+            yt-dlp \
+              --ignore-errors \
+              --ignore-no-formats-error \
+              --no-abort-on-error \
+              --retries infinite \
+              --fragment-retries infinite \
+              --continue \
+              --extract-audio \
+              --audio-format mp3 \
+              --audio-quality 0 \
+              --embed-thumbnail \
+              --add-metadata \
+              -o "downloads/%(title)s.%(ext)s" \
+              $COOKIES_FLAG \
+              "https://www.youtube.com/watch?v=$vid"
+
+            # Find newest MP3
+            latest_file=$(ls -t downloads/*.mp3 2>/dev/null | head -n 1)
+
+            # Verify MP3 exists
+            if [ -f "$latest_file" ]; then
+              echo "✅ MP3 created: $latest_file"
+              echo "Uploading to Internet Archive..."
+              IA_ACCESS_KEY="$IA_ACCESS_KEY" IA_SECRET_KEY="$IA_SECRET_KEY" \
+              ia upload "$IA_BUCKET_IDENTIFIER" "$latest_file" \
+                --metadata="collection:$IA_COLLECTION" \
+                --metadata="licenseurl:$IA_LICENSE_URL" \
+                --metadata="mediatype:audio" \
+                --metadata="title:$(basename "$latest_file" .mp3)" \
+                --ignore-existing
+              echo "✅ Upload complete for: $latest_file"
+            else
+              echo "::error::❌ No MP3 found for video $vid — skipping upload."
+            fi
+
+            echo "-----------------------------------"
+          done
 
       - name: Build Apple Podcasts–ready RSS feed
         env:
