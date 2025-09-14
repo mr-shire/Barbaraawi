@@ -94,7 +94,7 @@ jobs:
               --metadata="title:$(basename "$f" .mp3)"
           done
 
-      - name: Build RSS feed
+      - name: Build Apple Podcasts–ready RSS feed
         env:
           PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
           PODCAST_AUTHOR: ${{ secrets.PODCAST_AUTHOR }}
