@@ -1,4 +1,4 @@
-name: Build Podcast and Upload to Internet Archive
+name: Build Podcast and Upload to Internet Archive (per file)
 
 on:
   workflow_dispatch:
@@ -34,14 +34,19 @@ jobs:
           if [ -n "$YT_COOKIES_TXT" ]; then
             printf '%s' "$YT_COOKIES_TXT" > cookies.txt
             chmod 600 cookies.txt
-            echo "✓ cookies.txt created"
+            echo "cookies.txt created"
           else
-            echo "No cookies provided — proceeding without"
+            echo "No cookies provided"
           fi
 
-      - name: Download YouTube Playlist as MP3
+      - name: Download playlist and upload each MP3 to IA
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
+          IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          IA_COLLECTION: ${{ secrets.IA_COLLECTION }}
+          IA_LICENSE_URL: ${{ secrets.IA_LICENSE_URL }}
         run: |
           mkdir -p downloads
           if [ -f cookies.txt ]; then
@@ -49,6 +54,7 @@ jobs:
           else
             COOKIES_FLAG=""
           fi
+
           yt-dlp \
             --yes-playlist \
             --ignore-errors \
@@ -63,6 +69,7 @@ jobs:
             --embed-thumbnail \
             --add-metadata \
             -o "downloads/%(title)s.%(ext)s" \
+            --exec 'bash -lc "IA_ACCESS_KEY=\"$IA_ACCESS_KEY\" IA_SECRET_KEY=\"$IA_SECRET_KEY\" ia upload \"$IA_BUCKET_IDENTIFIER\" \"{}\" --metadata=collection:$IA_COLLECTION --metadata=licenseurl:$IA_LICENSE_URL --metadata=mediatype:audio --metadata=title:$(basename \"{}\" .mp3) --ignore-existing || echo IA_UPLOAD_FAILED: {}"' \
             $COOKIES_FLAG \
             "$YOUTUBE_PLAYLIST_URL"
 
@@ -72,28 +79,9 @@ jobs:
           shopt -s nullglob
           files=(downloads/*.mp3)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::No MP3 files found. Check the YouTube download step logs."
+            echo "::error::No MP3 files found. Check yt-dlp logs."
             exit 1
           fi
-
-      - name: Upload MP3s to Internet Archive (one by one)
-        env:
-          IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
-          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
-          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
-          IA_COLLECTION: ${{ secrets.IA_COLLECTION }}
-          IA_LICENSE_URL: ${{ secrets.IA_LICENSE_URL }}
-        run: |
-          for f in downloads/*.mp3; do
-            echo "Uploading $f to IA..."
-            IA_ACCESS_KEY="$IA_ACCESS_KEY" IA_SECRET_KEY="$IA_SECRET_KEY" \
-            ia upload "$IA_BUCKET_IDENTIFIER" "$f" \
-              --metadata="collection:$IA_COLLECTION" \
-              --metadata="licenseurl:$IA_LICENSE_URL" \
-              --metadata="mediatype:audio" \
-              --metadata="title:$(basename "$f" .mp3)" \
-              --ignore-existing
-          done
 
       - name: Build Apple Podcasts–ready RSS feed
         env:
