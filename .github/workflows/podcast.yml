@@ -87,6 +87,18 @@ jobs:
             "$YOUTUBE_PLAYLIST_URL" \
           || echo "⚠️ Some videos failed to download, but continuing..."
 
+      - name: Debug: list downloaded MP3s
+        run: |
+          echo "MP3 files in downloads/:"
+          ls -lh downloads || echo "No downloads directory found"
+
+      - name: Fail if no MP3s found
+        run: |
+          if [ -z "$(ls -A downloads/*.mp3 2>/dev/null)" ]; then
+            echo "::error::No MP3 files found. Check YouTube download step."
+            exit 1
+          fi
+
       - name: Build MP3s + Upload to IA + Generate RSS
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
@@ -105,6 +117,10 @@ jobs:
       - name: Prepare Pages artifact
         run: |
           mkdir -p public
+          if [ ! -f out/podcast.xml ]; then
+            echo "::error::podcast.xml not found — check build_feed.py output"
+            exit 1
+          fi
           cp out/podcast.xml public/
 
       - name: Upload artifact for GitHub Pages
