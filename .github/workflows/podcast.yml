@@ -1,4 +1,4 @@
-name: Build Podcast and Upload to Internet Archive (hardened filenames + retries)
+name: Build Podcast and Upload to Internet Archive (safe filenames + quoting)
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ jobs:
             echo "No cookies provided — proceeding without"
           fi
 
-      - name: Download, sanitize, and upload each MP3 with retries
+      - name: Download, sanitize, and upload each MP3
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
           IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
@@ -52,9 +52,7 @@ jobs:
           set -o pipefail
           mkdir -p downloads
 
-          # Helper: sanitize an arbitrary string into a safe filename stem
           sanitize_stem () {
-            # Read from stdin, output sanitized, lowercased, deduped, trimmed, length-limited
             tr '\n' ' ' \
             | iconv -f utf-8 -t ascii//TRANSLIT \
             | tr ' ' '_' \
@@ -65,14 +63,12 @@ jobs:
             | awk '{ s=$0; if (length(s)>80) s=substr(s,1,80); print s }'
           }
 
-          # Use cookies if provided
           if [ -f cookies.txt ]; then
             COOKIES_FLAG=(--cookies cookies.txt)
           else
             COOKIES_FLAG=()
           fi
 
-          # Get stable list of IDs and titles from the playlist
           mapfile -t videos < <(yt-dlp --flat-playlist --print "%(id)s\t%(title)s" "$YOUTUBE_PLAYLIST_URL")
 
           for entry in "${videos[@]}"; do
@@ -80,8 +76,6 @@ jobs:
             orig_title="${entry#*$'\t'}"
             echo "=== Processing video $vid ==="
 
-            # Download as MP3 into a temporary filename first to avoid clashes
-            # We still include [%(id)s] for easy association if needed
             yt-dlp \
               --ignore-no-formats-error \
               --no-abort-on-error \
@@ -101,7 +95,6 @@ jobs:
                 continue
               }
 
-            # Locate the MP3 just created for this ID
             shopt -s nullglob
             matches=( downloads/*\ [${vid}].mp3 )
             shopt -u nullglob
@@ -113,27 +106,19 @@ jobs:
             src_mp3="${matches[0]}"
             echo "✅ MP3 created: $src_mp3"
 
-            # Build a deterministic, safe final name from the original title + ID
             safe_stem=$(printf '%s' "$orig_title" | sanitize_stem)
-            if [ -z "$safe_stem" ]; then
-              safe_stem="episode"
-            fi
-            # Ensure uniqueness by appending the video ID and guaranteeing it ends with .mp3
+            [ -z "$safe_stem" ] && safe_stem="episode"
             final_name="${safe_stem}__${vid}.mp3"
-            # As a last safeguard, enforce whitelist on the full name
             final_name=$(printf '%s' "$final_name" | sed 's/[^A-Za-z0-9._-]//g' | tr '[:upper:]' '[:lower:]')
             final_path="downloads/$final_name"
 
-            # Move/rename the file to the final IA-safe path
             if [ "$src_mp3" != "$final_path" ]; then
-              mv -f "$src_mp3" "$final_path"
+              mv -f -- "$src_mp3" "$final_path"
               echo "Renamed to IA-safe: $final_path"
             fi
 
-            # Save mapping for RSS builder (safe name -> original title)
             echo -e "${final_name}\t${orig_title}" >> downloads/title_map.txt
 
-            # If already present on IA, skip upload
             remote_url="https://archive.org/download/${IA_BUCKET_IDENTIFIER}/${final_name}"
             if curl -sfI "$remote_url" >/dev/null; then
               echo "ℹ️ Already on IA: ${final_name} — skipping upload."
@@ -141,9 +126,8 @@ jobs:
               continue
             fi
 
-            # Upload with retries + backoff to handle transient failures (e.g., 503 slowdown)
-            max_attempts=6
-            delay=3
+            max_attempts=5
+            delay=5
             attempt=1
             upload_ok=0
             while [ $attempt -le $max_attempts ]; do
@@ -154,23 +138,14 @@ jobs:
                 --metadata="licenseurl:${IA_LICENSE_URL}" \
                 --metadata="mediatype:audio" \
                 --metadata="title:${orig_title}" \
-                --metadata="creator:${{ github.repository_owner }}" \
-                --metadata="subject:podcast, youtube, audio" \
                 --metadata="originalurl:https://www.youtube.com/watch?v=${vid}"
               rc=$?
-
-              if [ $rc -eq 0 ]; then
-                # Confirm visibility on IA (HEAD)
-                if curl -sfI "$remote_url" >/dev/null; then
-                  echo "✅ Upload confirmed on IA: $remote_url"
-                  upload_ok=1
-                  break
-                else
-                  echo "::warning::Upload succeeded but file not visible yet. Waiting..."
-                  sleep $delay
-                fi
+              if [ $rc -eq 0 ] && curl -sfI "$remote_url" >/dev/null; then
+                echo "✅ Upload confirmed on IA: $remote_url"
+                upload_ok=1
+                break
               else
-                echo "::warning::ia upload returned $rc"
+                echo "::warning::Upload attempt $attempt failed or not visible yet."
                 sleep $delay
               fi
               attempt=$((attempt + 1))
@@ -178,12 +153,7 @@ jobs:
               [ $delay -gt 60 ] && delay=60
             done
 
-            if [ $upload_ok -ne 1 ]; then
-              echo "::error::Upload failed after retries for ${final_name}"
-              # Continue to next video instead of failing the whole job
-            fi
-
-            # Gentle pacing to avoid IA slowdown
+            [ $upload_ok -ne 1 ] && echo "::error::Upload failed after retries for ${final_name}"
             sleep 2
             echo "-----------------------------------"
           done
@@ -211,7 +181,7 @@ jobs:
       - name: Prepare Pages artifact
         run: |
           mkdir -p public
-          cp out/podcast.xml public/
+          cp -- out/podcast.xml public/
 
       - name: Upload artifact for GitHub Pages
         uses: actions/upload-pages-artifact@v3
