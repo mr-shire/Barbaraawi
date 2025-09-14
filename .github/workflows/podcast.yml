@@ -1,4 +1,4 @@
-name: Build Podcast and Upload to Internet Archive (verify per file)
+name: Build Podcast and Upload to Internet Archive (safe filenames)
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ jobs:
             echo "No cookies provided — proceeding without"
           fi
 
-      - name: Download, verify, and upload each MP3
+      - name: Download, sanitise, and upload each MP3
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
           IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
@@ -64,7 +64,7 @@ jobs:
           for vid in "${video_ids[@]}"; do
             echo "=== Processing video $vid ==="
 
-            # Download a single video with a deterministic filename including the ID
+            # Download a single video with ID in filename
             yt-dlp \
               --ignore-errors \
               --ignore-no-formats-error \
@@ -85,7 +85,7 @@ jobs:
                 continue
               }
 
-            # Find the exact MP3 for this video ID
+            # Find the MP3 for this video ID
             file_glob="downloads/* [${vid}].mp3"
             shopt -s nullglob
             matches=( $file_glob )
@@ -100,27 +100,35 @@ jobs:
             mp3="${matches[0]}"
             echo "✅ MP3 created: $mp3"
 
-            # Skip upload if the same filename already exists on IA
-            remote_url="https://archive.org/download/${IA_BUCKET_IDENTIFIER}/$(basename "$mp3")"
+            # Create safe ASCII filename for IA upload
+            safe_name=$(basename "$mp3" | iconv -f utf-8 -t ascii//TRANSLIT | tr -cd '[:alnum:]._-')
+            safe_path="downloads/$safe_name"
+            if [ "$mp3" != "$safe_path" ]; then
+              mv "$mp3" "$safe_path"
+              echo "Renamed for IA: $safe_path"
+            fi
+
+            # Skip upload if already on IA
+            remote_url="https://archive.org/download/${IA_BUCKET_IDENTIFIER}/$(basename "$safe_path")"
             if curl -sfI "$remote_url" >/dev/null; then
-              echo "ℹ️ Already on IA: $(basename "$mp3") — skipping upload."
+              echo "ℹ️ Already on IA: $(basename "$safe_path") — skipping upload."
               echo "-----------------------------------"
               continue
             fi
 
             echo "Uploading to Internet Archive..."
             IA_ACCESS_KEY="$IA_ACCESS_KEY" IA_SECRET_KEY="$IA_SECRET_KEY" \
-            ia upload "$IA_BUCKET_IDENTIFIER" "$mp3" \
+            ia upload "$IA_BUCKET_IDENTIFIER" "$safe_path" \
               --metadata="collection:$IA_COLLECTION" \
               --metadata="licenseurl:$IA_LICENSE_URL" \
               --metadata="mediatype:audio" \
               --metadata="title:$(basename "$mp3" .mp3)" || {
-                echo "::error::Upload failed for $mp3"
+                echo "::error::Upload failed for $safe_path"
                 echo "-----------------------------------"
                 continue
               }
 
-            # Confirm it’s visible on IA before proceeding
+            # Confirm upload
             if curl -sfI "$remote_url" >/dev/null; then
               echo "✅ Upload confirmed on IA: $remote_url"
             else
