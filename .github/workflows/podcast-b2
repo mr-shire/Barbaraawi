@@ -1,9 +1,7 @@
-name: Build podcast, upload to private B2, publish RSS
+name: One-time YouTube Playlist to Podcast (Backblaze B2 Private, Verified Uploads)
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 9 */3 * *" # every 3 days at 09:00 UTC
+  workflow_dispatch: # manual trigger only
 
 permissions:
   contents: write
@@ -11,20 +9,23 @@ permissions:
   id-token: write
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install ffmpeg, B2 CLI, and latest yt-dlp nightly
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq curl
           python -m pip install --upgrade pip
-          pip install --upgrade --force-reinstall "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
+          # Backblaze official CLI
           pip install b2
+          # Fresh yt-dlp master to stay ahead of YouTube changes
+          pip install --upgrade --force-reinstall "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
 
       - name: Create cookies.txt if provided
         env:
@@ -38,15 +39,24 @@ jobs:
             echo "No cookies provided — proceeding without"
           fi
 
-      - name: Download audio and sanitize filenames
+      - name: Download, sanitize, verify, and upload each MP3 to B2 (private)
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p downloads
+          : > downloads/verified.txt
+          : > downloads/url_map.txt
           : > downloads/title_map.txt
 
+          echo "yt-dlp version:"
+          yt-dlp --version
+
+          # Helper: sanitize title -> safe filename stem
           sanitize_stem () {
             tr '\n' ' ' \
             | iconv -f utf-8 -t ascii//TRANSLIT \
@@ -58,25 +68,44 @@ jobs:
             | awk '{ s=$0; if (length(s)>80) s=substr(s,1,80); print s }'
           }
 
+          # Cookies flag (optional)
           if [ -f cookies.txt ]; then
             COOKIES_FLAG=(--cookies cookies.txt)
           else
             COOKIES_FLAG=()
           fi
 
-          mapfile -t videos < <(yt-dlp --flat-playlist --print "%(id)s\t%(title)s" "$YOUTUBE_PLAYLIST_URL")
+          echo "Preflight: listing playlist entries..."
+          mapfile -t videos < <(yt-dlp --flat-playlist --print "%(id)s\t%(title)s" "${COOKIES_FLAG[@]}" "$YOUTUBE_PLAYLIST_URL")
+          echo "Found ${#videos[@]} entries in the playlist."
+          if [ ${#videos[@]} -eq 0 ]; then
+            echo "::error::No videos found. Check playlist URL, region restrictions, or add cookies."
+            exit 1
+          fi
+
+          # Authorize B2 once (private bucket)
+          auth_json=$(b2 authorize-account "$B2_KEY_ID" "$B2_APPLICATION_KEY")
+          download_url=$(echo "$auth_json" | jq -r '.downloadUrl')
 
           for entry in "${videos[@]}"; do
             vid="${entry%%$'\t'*}"
             orig_title="${entry#*$'\t'}"
-            echo "=== Processing $vid ==="
-            yt_url="https://www.youtube.com/watch?v=$vid"
+            [ -z "$vid" ] && continue
 
+            echo "=== Processing video $vid ==="
+
+            # Download audio -> mp3 with resilient settings
+            # - Force web client to avoid "content not available on this app"
+            # - Robust retries and gentle sleeps
             yt-dlp \
+              --extractor-args "youtube:player_client=web" \
               --ignore-no-formats-error \
               --no-abort-on-error \
-              --retries infinite \
-              --fragment-retries infinite \
+              --retries 20 \
+              --fragment-retries 20 \
+              --sleep-requests 2 \
+              --sleep-interval 2 \
+              --max-sleep-interval 5 \
               --continue \
               --extract-audio \
               --audio-format mp3 \
@@ -85,17 +114,34 @@ jobs:
               --add-metadata \
               -o "downloads/%(title)s [%(id)s].%(ext)s" \
               "${COOKIES_FLAG[@]}" \
-              "$yt_url" || { echo "::warning::Download failed for $vid"; continue; }
+              "https://www.youtube.com/watch?v=$vid" || {
+                echo "::error::Download failed for $vid"
+                echo "-----------------------------------"
+                continue
+              }
 
+            # Find the produced mp3 reliably
             shopt -s nullglob
             matches=( downloads/*\ [${vid}].mp3 )
             shopt -u nullglob
             if [ ${#matches[@]} -eq 0 ]; then
-              echo "::warning::No MP3 found for $vid"
+              echo "::error::❌ No MP3 found for $vid after download."
+              echo "-----------------------------------"
               continue
             fi
             src_mp3="${matches[0]}"
 
+            # Size check (>50KB) to avoid broken outputs
+            size_bytes=$(stat -c%s "$src_mp3" 2>/dev/null || stat -f%z "$src_mp3")
+            if [ -z "$size_bytes" ] || [ "$size_bytes" -lt 50000 ]; then
+              echo "::error::❌ MP3 too small or empty for $vid."
+              rm -f -- "$src_mp3"
+              echo "-----------------------------------"
+              continue
+            fi
+            echo "✅ MP3 created (${size_bytes} bytes): $src_mp3"
+
+            # Sanitize final name
             safe_stem=$(printf '%s' "$orig_title" | sanitize_stem)
             [ -z "$safe_stem" ] && safe_stem="episode"
             final_name="${safe_stem}__${vid}.mp3"
@@ -107,39 +153,120 @@ jobs:
             fi
 
             printf '%s\t%s\n' "$final_name" "$orig_title" >> downloads/title_map.txt
+
+            # Upload to B2 (private bucket)
+            echo "Uploading to B2: $final_name"
+            b2 upload-file --noProgress "$B2_BUCKET_NAME" "$final_path" "$final_name"
+
+            # Verify presence in B2 by statting the uploaded file by name
+            # (list-file-names returns JSON if present)
+            verify_json=$(b2 list-file-names "$B2_BUCKET_NAME" "$final_name" 1)
+            present=$(echo "$verify_json" | jq -r --arg n "$final_name" '.files[]?.fileName == $n' | grep -c true || true)
+            if [ "$present" -eq 0 ]; then
+              echo "::error::Upload not verified on B2 for $final_name"
+              echo "-----------------------------------"
+              continue
+            fi
+
+            # Generate signed URL valid for 7 days (604800 seconds)
+            auth_token=$(b2 get-download-authorisation "$B2_BUCKET_NAME" "$final_name" 604800 | jq -r '.authorizationToken')
+            signed_url="${download_url}/file/${B2_BUCKET_NAME}/${final_name}?Authorization=${auth_token}"
+
+            # Mark verified and store signed URL for RSS
+            echo -e "${final_name}\t${orig_title}" >> downloads/verified.txt
+            echo -e "${final_name}\t${orig_title}\t${signed_url}" >> downloads/url_map.txt
+
+            echo "✅ Verified on B2 and signed URL generated."
+            echo "-----------------------------------"
           done
 
-          shopt -s nullglob
-          files=(downloads/*.mp3)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::No MP3 files produced."
+      - name: Fail if no verified uploads
+        shell: bash
+        run: |
+          if [ ! -s downloads/verified.txt ]; then
+            echo "::error::No verified uploads found. Aborting feed build."
+            echo "Troubleshooting hints:"
+            echo "- Check Actions logs above for yt-dlp errors (region, age-limit, membership)."
+            echo "- Try adding or updating YT_COOKIES_TXT."
+            echo "- Verify your playlist URL and that videos are playable in a browser."
             exit 1
           fi
 
-      - name: Upload MP3s to private B2 and generate signed URLs
+      - name: Build Apple Podcasts–ready RSS feed (verified only, signed URLs)
         env:
-          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
+          PODCAST_AUTHOR: ${{ secrets.PODCAST_AUTHOR }}
+          PODCAST_DESCRIPTION: ${{ secrets.PODCAST_DESCRIPTION }}
+          PODCAST_OWNER_EMAIL: ${{ secrets.PODCAST_OWNER_EMAIL }}
+          PODCAST_CATEGORY: ${{ secrets.PODCAST_CATEGORY }}
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p out
 
-          # Authorize account
-          auth_json=$(b2 authorize-account "$B2_KEY_ID" "$B2_APPLICATION_KEY")
-          download_url=$(echo "$auth_json" | jq -r '.downloadUrl')
+          esc () { python -c "import html,sys;print(html.escape(sys.stdin.read(), quote=True))"; }
 
-          : > downloads/url_map.txt
+          items=""
+          while IFS=$'\t' read -r file title url; do
+            [ -z "$file" ] && continue
+            length=$(stat -c%s "downloads/$file" 2>/dev/null || stat -f%z "downloads/$file")
+            pubdate="$(date -R)"
+            title_xml=$(printf '%s' "$title" | esc)
+            items="${items}
+              <item>
+                <title>${title_xml}</title>
+                <enclosure url=\"${url}\" length=\"${length}\" type=\"audio/mpeg\" />
+                <guid isPermaLink=\"false\">${file}</guid>
+                <pubDate>${pubdate}</pubDate>
+              </item>"
+          done < downloads/url_map.txt
 
-          for f in downloads/*.mp3; do
-            [ -e "$f" ] || continue
-            name=$(basename "$f")
-            title=$(grep -P "^\Q$name\E\t" downloads/title_map.txt | cut -f2-)
-            echo "Uploading $name"
-            b2 upload-file --noProgress "$B2_BUCKET_NAME" "$f" "$name"
+          podcast_title="${PODCAST_TITLE:-My Podcast}"
+          podcast_author="${PODCAST_AUTHOR:-Creator}"
+          podcast_desc="${PODCAST_DESCRIPTION:-Automated feed from YouTube}"
+          podcast_email="${PODCAST_OWNER_EMAIL:-owner@example.com}"
+          podcast_category="${PODCAST_CATEGORY:-Society & Culture}"
 
-            # Generate signed URL valid for 7 days (604800 seconds)
-            auth_token=$(b2 get-download-authorisation "$B2_BUCKET_NAME" "$name" 604800 | jq -r '.authorizationToken')
-            signed_url="${download_url}/file/${B2_BUCKET_NAME}/${name}?Authorization=${auth_token}"
+          cat > out/podcast.xml <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+            <channel>
+              <title>$(printf '%s' "$podcast_title" | esc)</title>
+              <link>https://github.com/${{ github.repository }}</link>
+              <language>en</language>
+              <itunes:author>$(printf '%s' "$podcast_author" | esc)</itunes:author>
+              <itunes:owner>
+                <itunes:name>$(printf '%s' "$podcast_author" | esc)</itunes:name>
+                <itunes:email>$(printf '%s' "$podcast_email" | esc)</itunes:email>
+              </itunes:owner>
+              <description>$(printf '%s' "$podcast_desc" | esc)</description>
+              <itunes:category text="$(printf '%s' "$podcast_category" | esc)"/>
+              ${items}
+            </channel>
+          </rss>
+          EOF
 
-            printf '%s\t%s\t%s\n' "$name" "$title" "$signed_url" >> downloads/url_map.txt
+      - name: Prepare Pages artifact
+        run: |
+          mkdir -p public
+          cp -- out/podcast.xml public/index.xml
+          cat > public/index.html <<HTML
+          <!doctype html><meta charset="utf-8">
+          <title>Podcast RSS</title>
+          <p>Your RSS feed is at <a href="index.xml">index.xml</a></p>
+          HTML
+
+      - name: Upload artifact for GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
