@@ -1,11 +1,7 @@
-name: Build Podcast and Upload to Internet Archive (safe filenames + quoting)
+name: One-time YouTube Playlist to Podcast (Verified Uploads)
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
+  workflow_dispatch: # manual trigger only
 
 jobs:
   build:
@@ -39,7 +35,7 @@ jobs:
             echo "No cookies provided — proceeding without"
           fi
 
-      - name: Download, sanitize, and upload each MP3
+      - name: Download, sanitize, verify, and upload each MP3
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
           IA_BUCKET_IDENTIFIER: ${{ secrets.IA_BUCKET_IDENTIFIER }}
@@ -51,6 +47,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p downloads
+          : > downloads/verified.txt
 
           sanitize_stem () {
             tr '\n' ' ' \
@@ -104,6 +101,14 @@ jobs:
               continue
             fi
             src_mp3="${matches[0]}"
+
+            # Size check (>50KB)
+            if [ ! -s "$src_mp3" ] || [ $(stat -c%s "$src_mp3") -lt 50000 ]; then
+              echo "::error::❌ MP3 too small or empty for $vid."
+              rm -f -- "$src_mp3"
+              echo "-----------------------------------"
+              continue
+            fi
             echo "✅ MP3 created: $src_mp3"
 
             safe_stem=$(printf '%s' "$orig_title" | sanitize_stem)
@@ -117,11 +122,10 @@ jobs:
               echo "Renamed to IA-safe: $final_path"
             fi
 
-            echo -e "${final_name}\t${orig_title}" >> downloads/title_map.txt
-
             remote_url="https://archive.org/download/${IA_BUCKET_IDENTIFIER}/${final_name}"
             if curl -sfI "$remote_url" >/dev/null; then
               echo "ℹ️ Already on IA: ${final_name} — skipping upload."
+              echo -e "${final_name}\t${orig_title}" >> downloads/verified.txt
               echo "-----------------------------------"
               continue
             fi
@@ -142,6 +146,7 @@ jobs:
               rc=$?
               if [ $rc -eq 0 ] && curl -sfI "$remote_url" >/dev/null; then
                 echo "✅ Upload confirmed on IA: $remote_url"
+                echo -e "${final_name}\t${orig_title}" >> downloads/verified.txt
                 upload_ok=1
                 break
               else
@@ -158,17 +163,15 @@ jobs:
             echo "-----------------------------------"
           done
 
-      - name: Fail if no MP3s found locally
+      - name: Fail if no verified uploads
         shell: bash
         run: |
-          shopt -s nullglob
-          files=(downloads/*.mp3)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::No MP3 files found. Check the per-file logs above."
+          if [ ! -s downloads/verified.txt ]; then
+            echo "::error::No verified uploads found. Aborting feed build."
             exit 1
           fi
 
-      - name: Build Apple Podcasts–ready RSS feed
+      - name: Build Apple Podcasts–ready RSS feed (verified only)
         env:
           PODCAST_TITLE: ${{ secrets.PODCAST_TITLE }}
           PODCAST_AUTHOR: ${{ secrets.PODCAST_AUTHOR }}
