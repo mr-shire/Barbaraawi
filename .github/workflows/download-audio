@@ -1,0 +1,58 @@
+name: Download YouTube Audio
+
+on:
+  workflow_dispatch: # run manually
+
+jobs:
+  download-audio:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg and latest yt-dlp nightly
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install --upgrade --force-reinstall "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
+
+      - name: Create cookies.txt if provided
+        env:
+          YT_COOKIES_TXT: ${{ secrets.YT_COOKIES_TXT }}
+        run: |
+          if [ -n "$YT_COOKIES_TXT" ]; then
+            printf '%s' "$YT_COOKIES_TXT" > cookies.txt
+            chmod 600 cookies.txt
+            echo "✓ cookies.txt created"
+          else
+            echo "No cookies provided — proceeding without"
+          fi
+
+      - name: Download audio
+        env:
+          YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
+        run: |
+          mkdir -p downloads
+          if [ -f cookies.txt ]; then
+            COOKIES_FLAG="--cookies cookies.txt"
+          else
+            COOKIES_FLAG=""
+          fi
+
+          yt-dlp \
+            --extract-audio \
+            --audio-format mp3 \
+            --audio-quality 0 \
+            --embed-thumbnail \
+            --add-metadata \
+            -o "downloads/%(title)s.%(ext)s" \
+            $COOKIES_FLAG \
+            "$YOUTUBE_PLAYLIST_URL"
+
+      - name: Upload audio as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-audio
+          path: downloads/
