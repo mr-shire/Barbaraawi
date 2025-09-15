@@ -22,9 +22,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq curl
           python -m pip install --upgrade pip
-          # Backblaze official CLI
           pip install b2
-          # Fresh yt-dlp master to stay ahead of YouTube changes
+          # Nightly/master build to keep up with YouTube changes
           pip install --upgrade --force-reinstall "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
 
       - name: Create cookies.txt if provided
@@ -95,8 +94,6 @@ jobs:
             echo "=== Processing video $vid ==="
 
             # Download audio -> mp3 with resilient settings
-            # - Force web client to avoid "content not available on this app"
-            # - Robust retries and gentle sleeps
             yt-dlp \
               --extractor-args "youtube:player_client=web" \
               --ignore-no-formats-error \
@@ -131,7 +128,7 @@ jobs:
             fi
             src_mp3="${matches[0]}"
 
-            # Size check (>50KB) to avoid broken outputs
+            # Size check (>50KB)
             size_bytes=$(stat -c%s "$src_mp3" 2>/dev/null || stat -f%z "$src_mp3")
             if [ -z "$size_bytes" ] || [ "$size_bytes" -lt 50000 ]; then
               echo "::error::❌ MP3 too small or empty for $vid."
@@ -139,7 +136,17 @@ jobs:
               echo "-----------------------------------"
               continue
             fi
-            echo "✅ MP3 created (${size_bytes} bytes): $src_mp3"
+
+            # Duration check with ffprobe (>5 seconds)
+            duration_sec=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$src_mp3" || echo "0")
+            duration_int=${duration_sec%.*}
+            if [ -z "$duration_int" ] || [ "$duration_int" -lt 5 ]; then
+              echo "::error::❌ MP3 duration < 5s for $vid (got ${duration_sec}s)."
+              rm -f -- "$src_mp3"
+              echo "-----------------------------------"
+              continue
+            fi
+            echo "✅ MP3 verified (${size_bytes} bytes, ~${duration_int}s): $src_mp3"
 
             # Sanitize final name
             safe_stem=$(printf '%s' "$orig_title" | sanitize_stem)
@@ -158,8 +165,7 @@ jobs:
             echo "Uploading to B2: $final_name"
             b2 upload-file --noProgress "$B2_BUCKET_NAME" "$final_path" "$final_name"
 
-            # Verify presence in B2 by statting the uploaded file by name
-            # (list-file-names returns JSON if present)
+            # Verify presence in B2 via list-file-names
             verify_json=$(b2 list-file-names "$B2_BUCKET_NAME" "$final_name" 1)
             present=$(echo "$verify_json" | jq -r --arg n "$final_name" '.files[]?.fileName == $n' | grep -c true || true)
             if [ "$present" -eq 0 ]; then
@@ -265,6 +271,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
+    # pages: write and id-token: write already granted above at job-level
       pages: write
       id-token: write
     steps:
