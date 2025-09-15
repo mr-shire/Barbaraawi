@@ -1,7 +1,7 @@
-name: Download YouTube Audio
+name: Download YouTube Audio (Nightly + Cookies)
 
 on:
-  workflow_dispatch: # run manually
+  workflow_dispatch: # run manually from Actions tab
 
 jobs:
   download-audio:
@@ -11,44 +11,43 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg and latest yt-dlp nightly
+      - name: Install ffmpeg and nightly yt-dlp
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
+          # Nightly build from master branch
           pip install --upgrade --force-reinstall "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
 
-      - name: Create cookies.txt if provided
+      - name: Create cookies.txt from secret
         env:
           YT_COOKIES_TXT: ${{ secrets.YT_COOKIES_TXT }}
         run: |
-          if [ -n "$YT_COOKIES_TXT" ]; then
-            printf '%s' "$YT_COOKIES_TXT" > cookies.txt
-            chmod 600 cookies.txt
-            echo "✓ cookies.txt created"
-          else
-            echo "No cookies provided — proceeding without"
+          if [ -z "$YT_COOKIES_TXT" ]; then
+            echo "::error::YT_COOKIES_TXT secret is empty. Add your exported cookies to repo secrets."
+            exit 1
           fi
+          printf '%s' "$YT_COOKIES_TXT" > cookies.txt
+          chmod 600 cookies.txt
+          echo "✓ cookies.txt created"
 
-      - name: Download audio
+      - name: Download audio from playlist
         env:
           YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
         run: |
-          mkdir -p downloads
-          if [ -f cookies.txt ]; then
-            COOKIES_FLAG="--cookies cookies.txt"
-          else
-            COOKIES_FLAG=""
+          if [ -z "$YOUTUBE_PLAYLIST_URL" ]; then
+            echo "::error::YOUTUBE_PLAYLIST_URL secret is empty."
+            exit 1
           fi
-
+          mkdir -p downloads
           yt-dlp \
             --extract-audio \
             --audio-format mp3 \
             --audio-quality 0 \
             --embed-thumbnail \
             --add-metadata \
+            --cookies cookies.txt \
             -o "downloads/%(title)s.%(ext)s" \
-            $COOKIES_FLAG \
             "$YOUTUBE_PLAYLIST_URL"
 
       - name: Upload audio as artifact
