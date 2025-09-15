@@ -41,19 +41,27 @@ cat.set("text", PODCAST_CATEGORY)
 # Optional: lastBuildDate
 SubElement(channel, "lastBuildDate").text = email.utils.format_datetime(datetime.datetime.utcnow())
 
-# Episodes from local downloads dir (already uploaded to IA by the time we build)
-items = sorted(DOWNLOADS_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
+# Read only verified uploads
+verified_file = DOWNLOADS_DIR / "verified.txt"
+if not verified_file.exists():
+    raise SystemExit("No verified.txt found — nothing to add to feed.")
 
-for mp3 in items:
-    size = mp3.stat().st_size
-    pub_date = email.utils.format_datetime(datetime.datetime.utcfromtimestamp(mp3.stat().st_mtime))
+with open(verified_file, "r", encoding="utf-8") as f:
+    lines = [line.strip().split("\t", 1) for line in f if line.strip()]
+
+for fname, orig_title in lines:
+    mp3_path = DOWNLOADS_DIR / fname
+    if not mp3_path.exists():
+        continue
+    size = mp3_path.stat().st_size
+    pub_date = email.utils.format_datetime(datetime.datetime.utcfromtimestamp(mp3_path.stat().st_mtime))
 
     item = SubElement(channel, "item")
-    SubElement(item, "title").text = mp3.stem
-    SubElement(item, "description").text = mp3.stem
+    SubElement(item, "title").text = orig_title
+    SubElement(item, "description").text = orig_title
     SubElement(item, "pubDate").text = pub_date
 
-    url = f"https://archive.org/download/{IA_BUCKET_IDENTIFIER}/{mp3.name}"
+    url = f"https://archive.org/download/{IA_BUCKET_IDENTIFIER}/{fname}"
     SubElement(item, "guid").text = url
     enc = SubElement(item, "enclosure")
     enc.set("url", url)
@@ -63,4 +71,5 @@ for mp3 in items:
 # Write feed
 out_path = OUTPUT_DIR / "podcast.xml"
 ElementTree(rss).write(out_path, encoding="utf-8", xml_declaration=True)
-print(f"RSS written: {out_path}")
+print(f"✅ RSS written: {out_path}")
+
