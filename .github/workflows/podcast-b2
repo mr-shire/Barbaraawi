@@ -1,0 +1,145 @@
+name: Build podcast, upload to private B2, publish RSS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 */3 * *" # every 3 days at 09:00 UTC
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq curl
+          python -m pip install --upgrade pip
+          pip install --upgrade --force-reinstall "yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
+          pip install b2
+
+      - name: Create cookies.txt if provided
+        env:
+          YT_COOKIES_TXT: ${{ secrets.YT_COOKIES_TXT }}
+        run: |
+          if [ -n "$YT_COOKIES_TXT" ]; then
+            printf '%s' "$YT_COOKIES_TXT" > cookies.txt
+            chmod 600 cookies.txt
+            echo "✓ cookies.txt created"
+          else
+            echo "No cookies provided — proceeding without"
+          fi
+
+      - name: Download audio and sanitize filenames
+        env:
+          YOUTUBE_PLAYLIST_URL: ${{ secrets.YOUTUBE_PLAYLIST_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p downloads
+          : > downloads/title_map.txt
+
+          sanitize_stem () {
+            tr '\n' ' ' \
+            | iconv -f utf-8 -t ascii//TRANSLIT \
+            | tr ' ' '_' \
+            | sed 's/[^A-Za-z0-9._-]//g' \
+            | sed 's/[_-]\{2,\}/_/g' \
+            | sed 's/^[_-]*//;s/[_-]*$//' \
+            | tr '[:upper:]' '[:lower:]' \
+            | awk '{ s=$0; if (length(s)>80) s=substr(s,1,80); print s }'
+          }
+
+          if [ -f cookies.txt ]; then
+            COOKIES_FLAG=(--cookies cookies.txt)
+          else
+            COOKIES_FLAG=()
+          fi
+
+          mapfile -t videos < <(yt-dlp --flat-playlist --print "%(id)s\t%(title)s" "$YOUTUBE_PLAYLIST_URL")
+
+          for entry in "${videos[@]}"; do
+            vid="${entry%%$'\t'*}"
+            orig_title="${entry#*$'\t'}"
+            echo "=== Processing $vid ==="
+            yt_url="https://www.youtube.com/watch?v=$vid"
+
+            yt-dlp \
+              --ignore-no-formats-error \
+              --no-abort-on-error \
+              --retries infinite \
+              --fragment-retries infinite \
+              --continue \
+              --extract-audio \
+              --audio-format mp3 \
+              --audio-quality 0 \
+              --embed-thumbnail \
+              --add-metadata \
+              -o "downloads/%(title)s [%(id)s].%(ext)s" \
+              "${COOKIES_FLAG[@]}" \
+              "$yt_url" || { echo "::warning::Download failed for $vid"; continue; }
+
+            shopt -s nullglob
+            matches=( downloads/*\ [${vid}].mp3 )
+            shopt -u nullglob
+            if [ ${#matches[@]} -eq 0 ]; then
+              echo "::warning::No MP3 found for $vid"
+              continue
+            fi
+            src_mp3="${matches[0]}"
+
+            safe_stem=$(printf '%s' "$orig_title" | sanitize_stem)
+            [ -z "$safe_stem" ] && safe_stem="episode"
+            final_name="${safe_stem}__${vid}.mp3"
+            final_name=$(printf '%s' "$final_name" | sed 's/[^A-Za-z0-9._-]//g' | tr '[:upper:]' '[:lower:]')
+            final_path="downloads/$final_name"
+
+            if [ "$src_mp3" != "$final_path" ]; then
+              mv -f -- "$src_mp3" "$final_path"
+            fi
+
+            printf '%s\t%s\n' "$final_name" "$orig_title" >> downloads/title_map.txt
+          done
+
+          shopt -s nullglob
+          files=(downloads/*.mp3)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No MP3 files produced."
+            exit 1
+          fi
+
+      - name: Upload MP3s to private B2 and generate signed URLs
+        env:
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Authorize account
+          auth_json=$(b2 authorize-account "$B2_KEY_ID" "$B2_APPLICATION_KEY")
+          download_url=$(echo "$auth_json" | jq -r '.downloadUrl')
+
+          : > downloads/url_map.txt
+
+          for f in downloads/*.mp3; do
+            [ -e "$f" ] || continue
+            name=$(basename "$f")
+            title=$(grep -P "^\Q$name\E\t" downloads/title_map.txt | cut -f2-)
+            echo "Uploading $name"
+            b2 upload-file --noProgress "$B2_BUCKET_NAME" "$f" "$name"
+
+            # Generate signed URL valid for 7 days (604800 seconds)
+            auth_token=$(b2 get-download-authorisation "$B2_BUCKET_NAME" "$name" 604800 | jq -r '.authorizationToken')
+            signed_url="${download_url}/file/${B2_BUCKET_NAME}/${name}?Authorization=${auth_token}"
+
+            printf '%s\t%s\t%s\n' "$name" "$title" "$signed_url" >> downloads/url_map.txt
